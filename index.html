@@ -362,7 +362,7 @@ async function handleFile(file){
     buf=await file.slice(0,chunk).arrayBuffer();
     try{ result=parseGGUF(buf,{fileSize}); break; }
     catch(e){
-      if(e instanceof Err && e.message.startsWith('unexpected end') && chunk<fileSize && chunk<cap){ chunk=Math.min(chunk*4,fileSize,cap); continue; }
+      if(e instanceof Err && e.message.includes('unexpected end') && chunk<fileSize && chunk<cap){ chunk=Math.min(chunk*4,fileSize,cap); continue; }
       error=e.message; break;
     }
   }

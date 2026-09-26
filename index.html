@@ -539,35 +539,40 @@ function setupFitGPU(r){
     return f && typeof f.value === 'number' ? f.value : null;
   };
 
-  // ---- Architecture metadata (all real GGUF keys, 2024–2026) ----
+  // ---- Architecture metadata ----
   const trainCtx          = kvNum(`${arch}.context_length`);
   const embed             = kvNum(`${arch}.embedding_length`);
   const headCount         = kvNum(`${arch}.attention.head_count`);
   const headCountKV       = kvNum(`${arch}.attention.head_count_kv`) || headCount;
   const blockCount        = kvNum(`${arch}.block_count`);
 
-  // Explicit head dims (Unsloth PR #4757) — preferred over embed/n_heads
+  // Explicit head dims
   const keyLength         = kvNum(`${arch}.attention.key_length`);
   const valueLength       = kvNum(`${arch}.attention.value_length`);
-  const keyLengthMLA      = kvNum(`${arch}.attention.key_length_mla`);
-  const valueLengthMLA    = kvNum(`${arch}.attention.value_length_mla`);
-  const headDimK          = keyLengthMLA || keyLength || (embed && headCount ? embed / headCount : null);
-  const headDimV          = valueLengthMLA || valueLength || headDimK;
+  const headDimK          = keyLength || (embed && headCount ? embed / headCount : null);
+  const headDimV          = valueLength || headDimK;
 
-  // Sliding window (Gemma-3/4, gpt-oss)
+  // Sliding window
   const slidingWindow     = kvNum(`${arch}.attention.sliding_window`);
-  const swaPattern        = r.kv.find(x => x.key === `${arch}.attention.sliding_window_pattern`);
   const hasSWA            = slidingWindow && slidingWindow > 0;
 
-  // MLA (DeepSeek-V2/V3, Kimi-K2, GLM-4.7/5)
+  // MLA detection (DeepSeek-V2/V3/V4, Kimi-K2/K3, GLM-4.7/5)
   const kvLoraRank        = kvNum(`${arch}.attention.kv_lora_rank`);
-  const isMLA             = kvLoraRank && kvLoraRank > 0;
+  const qLoraRank         = kvNum(`${arch}.attention.q_lora_rank`);
+  const hyperConnCount    = kvNum(`${arch}.hyper_connection_count`);
+  const isMLA             = (hyperConnCount && hyperConnCount > 0) ||
+                            (qLoraRank && qLoraRank > 0) ||
+                            (kvLoraRank && kvLoraRank > 0);
 
-  // Hybrid attention (Qwen3.5/3.8, Qwen3-Next)
+  // DFlash draft detection (speculative decoding draft model)
+  const isDFlash          = arch.includes('dflash') || arch.includes('dspark') ||
+                            r.kv.some(k => k.key.includes('target_layer_ids') || k.key.includes('target_layers'));
+
+  // Hybrid attention (Qwen3.5/3.8)
   const fullAttnInterval  = kvNum(`${arch}.full_attention_interval`);
   const isHybrid          = fullAttnInterval && fullAttnInterval > 0;
 
-  // Mamba/SSM (hybrid models)
+  // SSM (Mamba/RWKV)
   const ssmInnerSize      = kvNum(`${arch}.ssm.inner_size`);
   const ssmStateSize      = kvNum(`${arch}.ssm.state_size`);
   const isSSM             = ssmInnerSize && ssmStateSize;
@@ -597,44 +602,21 @@ function setupFitGPU(r){
   let flash  = false;
   let mmap   = true;
 
-  // ---- Compute buffer (MEASURED, not guessed) ----
-  // Sources: llama.cpp issue #26038 (800 MiB overestimate at 512K ctx ROCm);
-  //          ik_llama.cpp #629 (1264 MiB @ 32K ctx, n_ubatch=2048);
-  //          MiniMax-M2.5 reports (152–982 MiB range);
-  //          Rolling-KV PR (3.63 GiB @ 524K ctx on RTX PRO 6000).
-  // Empirical model: base + slope × ctx, slope scales with n_ubatch.
-  // Default n_ubatch = 512 in llama.cpp. The compute buffer scales
-  // primarily with n_ubatch, NOT with full context in recent builds.
+  // ---- Compute buffer (measured scaling) ----
   function computeBufferBytes(ctx, n_ubatch, flashOn) {
     const MiB = 1024 * 1024;
-    // Measured anchors at n_ubatch = 512: ~110–290 MiB
-    // At n_ubatch = 2048: ~1264 MiB
-    // Linear scaling on n_ubatch is close to the truth.
-    const basePerUbatch = 0.55 * MiB;        // MiB per ubatch slot
-    const graphOverhead = 80 * MiB;          // graph reservation base
-    const ctxScratch    = ctx * 0.0006 * MiB; // small residual ctx term
+    const basePerUbatch = 0.55 * MiB;
+    const graphOverhead = 80 * MiB;
+    const ctxScratch    = ctx * 0.0006 * MiB;
     let raw = graphOverhead + n_ubatch * basePerUbatch + ctxScratch;
-    if (flashOn) raw *= 0.65;               // flash attn trims ~35%
+    if (flashOn) raw *= 0.65;
     return raw;
   }
 
-  // ---- CUDA fixed overhead ----
-  // Sources: ggml PR #20595 (120–550 MB per GPU primary context);
-  //          distinct offload planner uses 320 MiB as the constant.
-  function cudaOverheadBytes() {
-    return 320 * 1024 * 1024;
-  }
+  function cudaOverheadBytes() { return 320 * 1024 * 1024; }
+  function hostOverheadBytes() { return 512 * 1024 * 1024; }
 
-  // ---- Host overhead ----
-  function hostOverheadBytes() {
-    return 512 * 1024 * 1024;
-  }
-
-  // ---- KV cache bytes per element ----
-  // f16 = 2 bytes/elem. q8_0 = 1.0 (8.5 bits rounded, block 32+2). q4_0 = 0.5625 (18 bytes per 32).
   const KV_BYTES = { f16: 2, q8_0: 1.0, q4_0: 0.5625 };
-
-  // Effective n_ubatch. llama.cpp defaults to 512.
   const N_UBATCH = 512;
 
   // ---- Wire up controls ----
@@ -666,16 +648,13 @@ function setupFitGPU(r){
     const gpuLayers = Math.max(0, Math.min(parseInt(layersIn.value) || 0, totalLayersInclOutput));
     const gpuTransformerLayers = Math.max(0, Math.min(gpuLayers, layerIdx.size));
 
-    // ---- GPU weights (oobabooga formula, still correct) ----
     const gpuWeights = gpuTransformerLayers * bytesPerLayer
                      + (gpuLayers > layerIdx.size ? outputBytes : 0);
     const cpuWeights = (layerBytesTotal + outputBytes) - gpuWeights;
 
     const bpe = KV_BYTES[kvType];
 
-    // ---- How many layers carry a KV cache ----
-    // Hybrid: only every Nth layer is full attention (Qwen3.5 full_attention_interval=4).
-    // SSM layers carry a fixed recurrent state, not a growing KV cache.
+    // ---- Layer accounting ----
     let attnLayerCount = layerCount;
     if (isHybrid) {
       attnLayerCount = Math.ceil(layerCount / fullAttnInterval);
@@ -684,36 +663,54 @@ function setupFitGPU(r){
     // ---- KV cache sizing ----
     let kvCacheTotal = 0;
     let kvFormula = '';
-    let swaShare = 0; // fraction of layers that are sliding-window-only
+    let tags = [];
 
     if (isMLA) {
-      // MLA (DeepSeek-V2/V3, Kimi-K2): K-only compressed latent + RoPE part.
-      // Per token per layer: (kv_lora_rank + rope_dim) elements, no V.
-      // rope_dim ≈ key_length - kv_lora_rank when MLAs use standard split.
-      const ropeDim = keyLength && keyLength > kvLoraRank
-        ? (keyLength - kvLoraRank)
-        : 64;
-      const mlaDim = kvLoraRank + ropeDim;
-      kvCacheTotal = ctx * attnLayerCount * mlaDim * bpe;
-      kvFormula = `MLA: ctx × ${attnLayerCount} attn layers × (${kvLoraRank}+${ropeDim}) × ${bpe}B`;
+      // MLA: compressed latent. Read kv_lora_rank from metadata or tensor shape.
+      let mlaDim = kvLoraRank;
+      if (!mlaDim) {
+        const wkv = r.tensors.find(t => /^blk\.\d+\.attn_kv\.weight$/.test(t.name));
+        if (wkv) mlaDim = wkv.dims[0]; // ne[0] = output dim = kv_lora_rank
+      }
+      if (!mlaDim) mlaDim = 512; // DeepSeek default
+
+      tags.push('MLA compressed latent');
+
+      if (isDFlash && hasSWA) {
+        // DFlash draft: ALL layers are sliding-window ring buffers.
+        // Cache stores the compressed latent only (no separate V).
+        const effCtx = Math.min(ctx, slidingWindow);
+        kvCacheTotal = effCtx * layerCount * mlaDim * bpe;
+        kvFormula = `DFlash MLA ring: ${layerCount} layers × min(ctx,${slidingWindow}) × kv_lora_rank(${mlaDim}) × ${bpe}B`;
+        tags.push(`sliding-window ${slidingWindow} ring`);
+        tags.push('speculative-decoding draft');
+      } else {
+        // Standard MLA (target model, not draft)
+        kvCacheTotal = ctx * attnLayerCount * mlaDim * bpe;
+        kvFormula = `MLA: ctx × ${attnLayerCount} attn layers × kv_lora_rank(${mlaDim}) × ${bpe}B`;
+      }
     } else if (isSSM && !headCount) {
-      // Pure SSM (RWKV, Mamba-only): fixed recurrent state, tiny.
-      // state per layer = ssm_state_size × ssm_inner_size × 4 bytes (f32 state)
       kvCacheTotal = layerCount * ssmStateSize * ssmInnerSize * 4;
       kvFormula = `SSM: ${layerCount} layers × state (${ssmStateSize}×${ssmInnerSize}) × 4B (fixed)`;
+      tags.push('SSM state');
     } else {
-      // Standard GQA (with optional SWA)
-      // Per layer per token: n_kv_heads × (head_dim_K + head_dim_V) × bpe
+      // GQA (with or without SWA)
       const nKvHeads  = headCountKV || 1;
       const dimK      = headDimK || 128;
       const dimV      = headDimV || dimK;
       const perLayerPerToken = nKvHeads * (dimK + dimV) * bpe;
 
-      if (hasSWA) {
-        // Determine SWA layer ratio.
-        // Prefer explicit sliding_window_pattern array (newest GGUFs).
-        // Fall back to 1/4 heuristic (Unsloth PR #4757: ~25% global, 75% SWA).
+      if (isDFlash && hasSWA) {
+        // DFlash draft GQA: ALL layers are sliding-window ring buffers.
+        const effCtx = Math.min(ctx, slidingWindow);
+        kvCacheTotal = effCtx * layerCount * perLayerPerToken;
+        kvFormula = `DFlash GQA ring: ${layerCount} layers × min(ctx,${slidingWindow}) × ${nKvHeads} KV × (${dimK}+${dimV}) × ${bpe}B`;
+        tags.push(`sliding-window ${slidingWindow} ring`);
+        tags.push('speculative-decoding draft');
+      } else if (hasSWA) {
+        // Interleaved SWA (Gemma-3/4, gpt-oss)
         let swaLayers, globalLayers;
+        const swaPattern = r.kv.find(x => x.key === `${arch}.attention.sliding_window_pattern`);
         if (swaPattern && swaPattern.value && swaPattern.value.items) {
           const items = swaPattern.value.items;
           swaLayers = items.filter(x => x === true).length;
@@ -722,28 +719,29 @@ function setupFitGPU(r){
           swaLayers = Math.round(attnLayerCount * 0.75);
           globalLayers = attnLayerCount - swaLayers;
         }
-        swaShare = swaLayers / Math.max(attnLayerCount, 1);
         const effCtxSWA = Math.min(ctx, slidingWindow);
         const swaKv  = effCtxSWA * swaLayers * perLayerPerToken;
         const globKv = ctx * globalLayers * perLayerPerToken;
         kvCacheTotal = swaKv + globKv;
-        kvFormula = `SWA+GQA: ${swaLayers}×min(ctx,${slidingWindow}) + ${globalLayers}×ctx, ${nKvHeads} KV heads × ${dimK}/${dimV} × ${bpe}B`;
+        kvFormula = `SWA+GQA: ${swaLayers}×min(ctx,${slidingWindow}) + ${globalLayers}×ctx, ${nKvHeads} KV × (${dimK}+${dimV}) × ${bpe}B`;
+        tags.push(`sliding-window ${slidingWindow}`);
       } else {
         kvCacheTotal = ctx * attnLayerCount * perLayerPerToken;
         kvFormula = `GQA: ctx × ${attnLayerCount} layers × ${nKvHeads} KV × (${dimK}+${dimV}) × ${bpe}B`;
       }
+      if (headDimK) tags.push(`head_dim ${headDimK}/${headDimV}`);
     }
+
+    if (isHybrid) tags.push(`hybrid (1 full attn / ${fullAttnInterval})`);
 
     const kvCacheGpuShare = gpuLayers > 0
       ? kvCacheTotal * (gpuTransformerLayers / Math.max(layerCount, 1))
       : 0;
 
-    // ---- Buffers & overhead ----
     const computeBuf   = gpuLayers > 0 ? computeBufferBytes(ctx, N_UBATCH, flash) : 0;
     const cudaOverhead = gpuLayers > 0 ? cudaOverheadBytes() : 0;
     const hostOverhead = hostOverheadBytes();
 
-    // ---- Totals (GiB, not GB) ----
     const GiB = 1024 * 1024 * 1024;
     const vramBytes = gpuWeights + kvCacheGpuShare + computeBuf + cudaOverhead;
     const ramBytes  = (mmap ? 0 : cpuWeights)
@@ -752,13 +750,6 @@ function setupFitGPU(r){
     const budgetBytes = budget * GiB;
     const fits = vramBytes <= budgetBytes;
 
-    // ---- Architecture flags for the note ----
-    const tags = [];
-    if (isMLA)    tags.push('MLA compressed latent');
-    if (hasSWA)   tags.push(`sliding-window ${slidingWindow}`);
-    if (isHybrid) tags.push(`hybrid (1 full attn / ${fullAttnInterval})`);
-    if (isSSM)    tags.push('SSM state');
-    if (headDimK && !isMLA) tags.push(`head_dim ${headDimK}/${headDimV}`);
     const archNote = tags.length ? tags.join(' · ') : 'standard GQA (legacy metadata)';
 
     const out = report.querySelector('#fitOut');
@@ -778,7 +769,8 @@ function setupFitGPU(r){
       </div>
       <p class="note" style="margin-top:14px"><strong>Detection:</strong> ${esc(archNote)}</p>
       <p class="note"><strong>KV formula:</strong> ${esc(kvFormula)}</p>
-      <p class="note">Compute buffer model: ${fmtBytes(80*1024*1024)} graph reserve + ${N_UBATCH} ubatch × 0.55 MiB/slot${flash ? ' × 0.65 (flash attn)' : ''}. Measured range across 2025–2026 llama.cpp builds: 110 MiB – 3.63 GiB depending on n_ubatch and ctx. CUDA overhead 320 MiB (real range 120–550 MiB by GPU). Estimates are ±15%; actual peak can exceed this at long contexts with large batch sizes.</p>`;
+      ${isDFlash ? `<p class="note" style="color:var(--red)"><strong>Note:</strong> This is a speculative-decoding draft model. It runs alongside a target model. The memory shown here is for the draft only — the target model requires additional VRAM/RAM.</p>` : ''}
+      <p class="note">Compute buffer model: 80 MiB graph reserve + ${N_UBATCH} ubatch × 0.55 MiB/slot${flash ? ' × 0.65 (flash attn)' : ''}. CUDA overhead 320 MiB (real range 120–550 MiB by GPU). Estimates are ±15%.</p>`;
   }
   compute();
 }

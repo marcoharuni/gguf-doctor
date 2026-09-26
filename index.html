@@ -237,7 +237,6 @@ class Cur{
   i64(){ this.need(8); const lo=this.dv.getUint32(this.o,true), hi=this.dv.getInt32(this.o+4,true); this.o+=8; return hi*4294967296+lo; }
   str(){
     const len=this.u64();
-    if(len<0||this.o+len>this.len) throw new Err(`bad string length at offset ${this.o-8}`);
     this.need(len);
     const bytes=new Uint8Array(this.dv.buffer,this.o,len);
     this.o+=len;

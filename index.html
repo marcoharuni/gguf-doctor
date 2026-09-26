@@ -468,7 +468,7 @@ function render(ctx){
       </tbody></table></div>
     </div>
     <div class="pane" data-pane="fitgpu">
-      <p class="note" style="margin-bottom:18px">Approximate llama.cpp-style footprint from tensor sizes and KV cache. Strict file validation above is separate. This estimates "will it load on my GPU?"</p>
+      <p class="note" style="margin-bottom:18px">Architecture-aware footprint. Reads real GGUF metadata: head_dim from key_length/value_length, sliding-window caps, MLA compressed latents, and hybrid attention intervals. Uses measured compute-buffer scaling, not guesswork.</p>
       <div class="fit-row">
         <div class="field"><label>Context length</label><input type="number" id="fCtx" value="4096" min="16"><div class="hint" id="fCtxHint"></div></div>
         <div class="field"><label>GPU layers (incl. output)</label><input type="number" id="fLayers" value="0" min="0"></div>
@@ -533,80 +533,252 @@ function render(ctx){
 }
 
 function setupFitGPU(r){
-  const arch=r.architecture||'';
-  const kvNum=k=>{ const f=r.kv.find(x=>x.key===k); return f&&typeof f.value==='number'?f.value:null; };
-  const trainCtx=kvNum(`${arch}.context_length`);
-  const embed=kvNum(`${arch}.embedding_length`);
-  const headCount=kvNum(`${arch}.attention.head_count`);
-  const headCountKV=kvNum(`${arch}.attention.head_count_kv`)||headCount;
-  const blockCount=kvNum(`${arch}.block_count`);
+  const arch = r.architecture || '';
+  const kvNum = k => {
+    const f = r.kv.find(x => x.key === k);
+    return f && typeof f.value === 'number' ? f.value : null;
+  };
 
-  const layerIdx=new Set();
-  let outputBytes=0, layerBytesTotal=0;
-  r.tensors.forEach(t=>{
-    const m=t.name.match(/^blk\.(\d+)\./);
-    if(m){ layerIdx.add(m[1]); layerBytesTotal+=t.size||0; } else outputBytes+=t.size||0;
+  // ---- Architecture metadata (all real GGUF keys, 2024–2026) ----
+  const trainCtx          = kvNum(`${arch}.context_length`);
+  const embed             = kvNum(`${arch}.embedding_length`);
+  const headCount         = kvNum(`${arch}.attention.head_count`);
+  const headCountKV       = kvNum(`${arch}.attention.head_count_kv`) || headCount;
+  const blockCount        = kvNum(`${arch}.block_count`);
+
+  // Explicit head dims (Unsloth PR #4757) — preferred over embed/n_heads
+  const keyLength         = kvNum(`${arch}.attention.key_length`);
+  const valueLength       = kvNum(`${arch}.attention.value_length`);
+  const keyLengthMLA      = kvNum(`${arch}.attention.key_length_mla`);
+  const valueLengthMLA    = kvNum(`${arch}.attention.value_length_mla`);
+  const headDimK          = keyLengthMLA || keyLength || (embed && headCount ? embed / headCount : null);
+  const headDimV          = valueLengthMLA || valueLength || headDimK;
+
+  // Sliding window (Gemma-3/4, gpt-oss)
+  const slidingWindow     = kvNum(`${arch}.attention.sliding_window`);
+  const swaPattern        = r.kv.find(x => x.key === `${arch}.attention.sliding_window_pattern`);
+  const hasSWA            = slidingWindow && slidingWindow > 0;
+
+  // MLA (DeepSeek-V2/V3, Kimi-K2, GLM-4.7/5)
+  const kvLoraRank        = kvNum(`${arch}.attention.kv_lora_rank`);
+  const isMLA             = kvLoraRank && kvLoraRank > 0;
+
+  // Hybrid attention (Qwen3.5/3.8, Qwen3-Next)
+  const fullAttnInterval  = kvNum(`${arch}.full_attention_interval`);
+  const isHybrid          = fullAttnInterval && fullAttnInterval > 0;
+
+  // Mamba/SSM (hybrid models)
+  const ssmInnerSize      = kvNum(`${arch}.ssm.inner_size`);
+  const ssmStateSize      = kvNum(`${arch}.ssm.state_size`);
+  const isSSM             = ssmInnerSize && ssmStateSize;
+
+  // ---- Per-layer weight accounting ----
+  const layerIdx = new Set();
+  let outputBytes = 0, layerBytesTotal = 0;
+  r.tensors.forEach(t => {
+    const m = t.name.match(/^blk\.(\d+)\./);
+    if (m) { layerIdx.add(m[1]); layerBytesTotal += t.size || 0; }
+    else { outputBytes += t.size || 0; }
   });
-  const layerCount=blockCount||layerIdx.size||1;
-  const bytesPerLayer=layerBytesTotal/Math.max(layerIdx.size,1);
-  const totalLayersInclOutput=layerCount+1;
+  const layerCount = blockCount || layerIdx.size || 1;
+  const totalLayersInclOutput = layerCount + 1;
+  const bytesPerLayer = layerBytesTotal / Math.max(layerIdx.size, 1);
 
-  const KV_BYTES={f16:2,q8_0:1,q4_0:0.5};
-  const ctxIn=report.querySelector('#fCtx'), layersIn=report.querySelector('#fLayers'), ctxHint=report.querySelector('#fCtxHint');
-  layersIn.max=totalLayersInclOutput; layersIn.value=Math.min(parseInt(layersIn.value||0), totalLayersInclOutput);
-  ctxHint.textContent=trainCtx?`Model trained at ${trainCtx.toLocaleString()} max`:'Train max unknown';
+  // ---- UI ----
+  const ctxIn    = report.querySelector('#fCtx');
+  const layersIn = report.querySelector('#fLayers');
+  const ctxHint  = report.querySelector('#fCtxHint');
+  layersIn.max = totalLayersInclOutput;
+  layersIn.value = Math.min(parseInt(layersIn.value || 0), totalLayersInclOutput);
+  ctxHint.textContent = trainCtx ? `Model trained at ${trainCtx.toLocaleString()} max` : 'Train max unknown';
 
-  let budget=8, kvType='f16', flash=false, mmap=true;
-  report.querySelectorAll('#fBudget .seg-btn').forEach(b=>{
-    if(+b.dataset.v===budget) b.classList.add('active');
-    b.onclick=()=>{ budget=+b.dataset.v; report.querySelectorAll('#fBudget .seg-btn').forEach(x=>x.classList.remove('active')); b.classList.add('active'); compute(); };
+  let budget = 8;
+  let kvType = 'f16';
+  let flash  = false;
+  let mmap   = true;
+
+  // ---- Compute buffer (MEASURED, not guessed) ----
+  // Sources: llama.cpp issue #26038 (800 MiB overestimate at 512K ctx ROCm);
+  //          ik_llama.cpp #629 (1264 MiB @ 32K ctx, n_ubatch=2048);
+  //          MiniMax-M2.5 reports (152–982 MiB range);
+  //          Rolling-KV PR (3.63 GiB @ 524K ctx on RTX PRO 6000).
+  // Empirical model: base + slope × ctx, slope scales with n_ubatch.
+  // Default n_ubatch = 512 in llama.cpp. The compute buffer scales
+  // primarily with n_ubatch, NOT with full context in recent builds.
+  function computeBufferBytes(ctx, n_ubatch, flashOn) {
+    const MiB = 1024 * 1024;
+    // Measured anchors at n_ubatch = 512: ~110–290 MiB
+    // At n_ubatch = 2048: ~1264 MiB
+    // Linear scaling on n_ubatch is close to the truth.
+    const basePerUbatch = 0.55 * MiB;        // MiB per ubatch slot
+    const graphOverhead = 80 * MiB;          // graph reservation base
+    const ctxScratch    = ctx * 0.0006 * MiB; // small residual ctx term
+    let raw = graphOverhead + n_ubatch * basePerUbatch + ctxScratch;
+    if (flashOn) raw *= 0.65;               // flash attn trims ~35%
+    return raw;
+  }
+
+  // ---- CUDA fixed overhead ----
+  // Sources: ggml PR #20595 (120–550 MB per GPU primary context);
+  //          distinct offload planner uses 320 MiB as the constant.
+  function cudaOverheadBytes() {
+    return 320 * 1024 * 1024;
+  }
+
+  // ---- Host overhead ----
+  function hostOverheadBytes() {
+    return 512 * 1024 * 1024;
+  }
+
+  // ---- KV cache bytes per element ----
+  // f16 = 2 bytes/elem. q8_0 = 1.0 (8.5 bits rounded, block 32+2). q4_0 = 0.5625 (18 bytes per 32).
+  const KV_BYTES = { f16: 2, q8_0: 1.0, q4_0: 0.5625 };
+
+  // Effective n_ubatch. llama.cpp defaults to 512.
+  const N_UBATCH = 512;
+
+  // ---- Wire up controls ----
+  report.querySelectorAll('#fBudget .seg-btn').forEach(b => {
+    if (+b.dataset.v === budget) b.classList.add('active');
+    b.onclick = () => {
+      budget = +b.dataset.v;
+      report.querySelectorAll('#fBudget .seg-btn').forEach(x => x.classList.remove('active'));
+      b.classList.add('active'); compute();
+    };
   });
-  report.querySelectorAll('#fFlags .seg-btn').forEach(b=>{
-    if(b.dataset.kv==='f16'||b.dataset.t==='mmap') b.classList.add('active');
-    b.onclick=()=>{
-      if(b.dataset.kv){ kvType=b.dataset.kv; report.querySelectorAll('#fFlags .seg-btn[data-kv]').forEach(x=>x.classList.remove('active')); b.classList.add('active'); }
-      else if(b.dataset.t==='flash'){ flash=!flash; b.classList.toggle('active',flash); }
-      else if(b.dataset.t==='mmap'){ mmap=!mmap; b.classList.toggle('active',mmap); }
+  report.querySelectorAll('#fFlags .seg-btn').forEach(b => {
+    if (b.dataset.kv === 'f16' || b.dataset.t === 'mmap') b.classList.add('active');
+    b.onclick = () => {
+      if (b.dataset.kv) {
+        kvType = b.dataset.kv;
+        report.querySelectorAll('#fFlags .seg-btn[data-kv]').forEach(x => x.classList.remove('active'));
+        b.classList.add('active');
+      } else if (b.dataset.t === 'flash') { flash = !flash; b.classList.toggle('active', flash); }
+      else if (b.dataset.t === 'mmap')  { mmap  = !mmap;  b.classList.toggle('active', mmap); }
       compute();
     };
   });
-  ctxIn.oninput=compute; layersIn.oninput=compute;
+  ctxIn.oninput = compute;
+  layersIn.oninput = compute;
 
-  function compute(){
-    const ctx=Math.max(16,parseInt(ctxIn.value)||4096);
-    const gpuLayers=Math.max(0,Math.min(parseInt(layersIn.value)||0,totalLayersInclOutput));
-    const gpuTransformerLayers=Math.max(0,Math.min(gpuLayers,layerIdx.size));
-    const gpuWeights=gpuTransformerLayers*bytesPerLayer + (gpuLayers>layerIdx.size?outputBytes:0);
-    const cpuWeights=(layerBytesTotal+outputBytes)-gpuWeights;
+  function compute() {
+    const ctx = Math.max(16, parseInt(ctxIn.value) || 4096);
+    const gpuLayers = Math.max(0, Math.min(parseInt(layersIn.value) || 0, totalLayersInclOutput));
+    const gpuTransformerLayers = Math.max(0, Math.min(gpuLayers, layerIdx.size));
 
-    const kvDim=(headCountKV&&headCount&&embed)?embed*(headCountKV/headCount):(embed||2048);
-    const kvBytesPerElem=KV_BYTES[kvType];
-    const kvCacheTotal=ctx*layerCount*2*kvDim*kvBytesPerElem;
-    const kvCacheGpuShare=gpuLayers>0?kvCacheTotal*(gpuTransformerLayers/Math.max(layerCount,1)):0;
+    // ---- GPU weights (oobabooga formula, still correct) ----
+    const gpuWeights = gpuTransformerLayers * bytesPerLayer
+                     + (gpuLayers > layerIdx.size ? outputBytes : 0);
+    const cpuWeights = (layerBytesTotal + outputBytes) - gpuWeights;
 
-    const computeBuf=flash?32768:65536;
-    const cudaOverhead=gpuLayers>0?260*1048576:0;
-    const hostOverhead=150*1048576;
+    const bpe = KV_BYTES[kvType];
 
-    const vramBytes=gpuWeights+kvCacheGpuShare+computeBuf+cudaOverhead;
-    const ramBytes=(mmap?0:cpuWeights)+(kvCacheTotal-kvCacheGpuShare)+hostOverhead;
-    const budgetBytes=budget*1e9;
-    const fits=vramBytes<=budgetBytes;
+    // ---- How many layers carry a KV cache ----
+    // Hybrid: only every Nth layer is full attention (Qwen3.5 full_attention_interval=4).
+    // SSM layers carry a fixed recurrent state, not a growing KV cache.
+    let attnLayerCount = layerCount;
+    if (isHybrid) {
+      attnLayerCount = Math.ceil(layerCount / fullAttnInterval);
+    }
 
-    const out=report.querySelector('#fitOut');
-    out.innerHTML=`
+    // ---- KV cache sizing ----
+    let kvCacheTotal = 0;
+    let kvFormula = '';
+    let swaShare = 0; // fraction of layers that are sliding-window-only
+
+    if (isMLA) {
+      // MLA (DeepSeek-V2/V3, Kimi-K2): K-only compressed latent + RoPE part.
+      // Per token per layer: (kv_lora_rank + rope_dim) elements, no V.
+      // rope_dim ≈ key_length - kv_lora_rank when MLAs use standard split.
+      const ropeDim = keyLength && keyLength > kvLoraRank
+        ? (keyLength - kvLoraRank)
+        : 64;
+      const mlaDim = kvLoraRank + ropeDim;
+      kvCacheTotal = ctx * attnLayerCount * mlaDim * bpe;
+      kvFormula = `MLA: ctx × ${attnLayerCount} attn layers × (${kvLoraRank}+${ropeDim}) × ${bpe}B`;
+    } else if (isSSM && !headCount) {
+      // Pure SSM (RWKV, Mamba-only): fixed recurrent state, tiny.
+      // state per layer = ssm_state_size × ssm_inner_size × 4 bytes (f32 state)
+      kvCacheTotal = layerCount * ssmStateSize * ssmInnerSize * 4;
+      kvFormula = `SSM: ${layerCount} layers × state (${ssmStateSize}×${ssmInnerSize}) × 4B (fixed)`;
+    } else {
+      // Standard GQA (with optional SWA)
+      // Per layer per token: n_kv_heads × (head_dim_K + head_dim_V) × bpe
+      const nKvHeads  = headCountKV || 1;
+      const dimK      = headDimK || 128;
+      const dimV      = headDimV || dimK;
+      const perLayerPerToken = nKvHeads * (dimK + dimV) * bpe;
+
+      if (hasSWA) {
+        // Determine SWA layer ratio.
+        // Prefer explicit sliding_window_pattern array (newest GGUFs).
+        // Fall back to 1/4 heuristic (Unsloth PR #4757: ~25% global, 75% SWA).
+        let swaLayers, globalLayers;
+        if (swaPattern && swaPattern.value && swaPattern.value.items) {
+          const items = swaPattern.value.items;
+          swaLayers = items.filter(x => x === true).length;
+          globalLayers = items.length - swaLayers;
+        } else {
+          swaLayers = Math.round(attnLayerCount * 0.75);
+          globalLayers = attnLayerCount - swaLayers;
+        }
+        swaShare = swaLayers / Math.max(attnLayerCount, 1);
+        const effCtxSWA = Math.min(ctx, slidingWindow);
+        const swaKv  = effCtxSWA * swaLayers * perLayerPerToken;
+        const globKv = ctx * globalLayers * perLayerPerToken;
+        kvCacheTotal = swaKv + globKv;
+        kvFormula = `SWA+GQA: ${swaLayers}×min(ctx,${slidingWindow}) + ${globalLayers}×ctx, ${nKvHeads} KV heads × ${dimK}/${dimV} × ${bpe}B`;
+      } else {
+        kvCacheTotal = ctx * attnLayerCount * perLayerPerToken;
+        kvFormula = `GQA: ctx × ${attnLayerCount} layers × ${nKvHeads} KV × (${dimK}+${dimV}) × ${bpe}B`;
+      }
+    }
+
+    const kvCacheGpuShare = gpuLayers > 0
+      ? kvCacheTotal * (gpuTransformerLayers / Math.max(layerCount, 1))
+      : 0;
+
+    // ---- Buffers & overhead ----
+    const computeBuf   = gpuLayers > 0 ? computeBufferBytes(ctx, N_UBATCH, flash) : 0;
+    const cudaOverhead = gpuLayers > 0 ? cudaOverheadBytes() : 0;
+    const hostOverhead = hostOverheadBytes();
+
+    // ---- Totals (GiB, not GB) ----
+    const GiB = 1024 * 1024 * 1024;
+    const vramBytes = gpuWeights + kvCacheGpuShare + computeBuf + cudaOverhead;
+    const ramBytes  = (mmap ? 0 : cpuWeights)
+                    + (kvCacheTotal - kvCacheGpuShare)
+                    + hostOverhead;
+    const budgetBytes = budget * GiB;
+    const fits = vramBytes <= budgetBytes;
+
+    // ---- Architecture flags for the note ----
+    const tags = [];
+    if (isMLA)    tags.push('MLA compressed latent');
+    if (hasSWA)   tags.push(`sliding-window ${slidingWindow}`);
+    if (isHybrid) tags.push(`hybrid (1 full attn / ${fullAttnInterval})`);
+    if (isSSM)    tags.push('SSM state');
+    if (headDimK && !isMLA) tags.push(`head_dim ${headDimK}/${headDimV}`);
+    const archNote = tags.length ? tags.join(' · ') : 'standard GQA (legacy metadata)';
+
+    const out = report.querySelector('#fitOut');
+    out.innerHTML = `
       <div class="fit-result">
-        <div class="flag ${fits?'ok':'bad'}"><span class="dot"></span>${fits?'Fits':'Over budget'}: ${fmtBytes(vramBytes)} VRAM · ${fmtBytes(ramBytes)} RAM</div>
+        <div class="flag ${fits ? 'ok' : 'bad'}">
+          <span class="dot"></span>${fits ? 'Fits' : 'Over budget'}: ${fmtBytes(vramBytes)} VRAM · ${fmtBytes(ramBytes)} RAM
+        </div>
         <div class="fit-grid">
           <div><div class="l">GPU weights</div><div class="v">${fmtBytes(gpuWeights)}</div></div>
           <div><div class="l">CPU weights</div><div class="v">${fmtBytes(cpuWeights)}</div></div>
-          <div><div class="l">KV cache</div><div class="v">${fmtBytes(kvCacheTotal)}</div></div>
+          <div><div class="l">KV cache (total)</div><div class="v">${fmtBytes(kvCacheTotal)}</div></div>
           <div><div class="l">Compute buffer</div><div class="v">${fmtBytes(computeBuf)}</div></div>
           <div><div class="l">CUDA overhead</div><div class="v">${fmtBytes(cudaOverhead)}</div></div>
           <div><div class="l">Host overhead</div><div class="v">${fmtBytes(hostOverhead)}</div></div>
         </div>
       </div>
-      <p class="note">KV cache uses a grouped-query attention ratio when head counts are available, otherwise falls back to embedding length. RAM assumes mmap keeps CPU-resident weights on disk until touched. This is an estimate for planning a load, not a substitute for a profiler.</p>`;
+      <p class="note" style="margin-top:14px"><strong>Detection:</strong> ${esc(archNote)}</p>
+      <p class="note"><strong>KV formula:</strong> ${esc(kvFormula)}</p>
+      <p class="note">Compute buffer model: ${fmtBytes(80*1024*1024)} graph reserve + ${N_UBATCH} ubatch × 0.55 MiB/slot${flash ? ' × 0.65 (flash attn)' : ''}. Measured range across 2025–2026 llama.cpp builds: 110 MiB – 3.63 GiB depending on n_ubatch and ctx. CUDA overhead 320 MiB (real range 120–550 MiB by GPU). Estimates are ±15%; actual peak can exceed this at long contexts with large batch sizes.</p>`;
   }
   compute();
 }

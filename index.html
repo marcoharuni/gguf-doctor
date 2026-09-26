@@ -128,30 +128,6 @@ tr:hover td{background:var(--surface-2)}
 .tbl-scroll th:first-child, .tbl-scroll td:first-child{padding-left:16px}
 .note{color:var(--dimmer); font-size:12px; margin-top:10px}
 
-.fit-row{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:20px}
-@media (max-width:520px){ .fit-row{grid-template-columns:1fr} }
-.field label{display:block; color:var(--dimmer); font-size:11.5px; margin-bottom:8px}
-.field input[type=number]{
-  width:100%; background:var(--surface); border:1px solid var(--edge); border-radius:var(--r-sm);
-  color:var(--text); font-size:14px; padding:11px 13px; outline:none;
-}
-.field input[type=number]:focus{border-color:var(--blue)}
-.field .hint{color:var(--dimmer); font-size:11px; margin-top:6px}
-.seg{display:flex; flex-wrap:wrap; gap:8px; margin-bottom:11px}
-.seg-btn{
-  border:1px solid var(--edge); background:var(--surface); color:var(--dim); border-radius:99px;
-  padding:9px 15px; font-size:12.5px; cursor:pointer; transition:border-color .12s,color .12s,background .12s;
-}
-.seg-btn:hover{border-color:var(--edge-hi); color:var(--text)}
-.seg-btn.active{border-color:var(--blue-deep); color:var(--blue); background:var(--blue-surface)}
-.fit-result{border:1px solid var(--edge); border-radius:var(--r-md); padding:22px; margin-top:18px; background:var(--surface)}
-.fit-result .flag{display:inline-flex; align-items:center; gap:9px; font-size:16px; font-weight:500; margin-bottom:18px}
-.fit-result .flag .dot{width:9px;height:9px;border-radius:99px}
-.fit-result .flag.ok .dot{background:var(--blue); box-shadow:0 0 0 4px var(--blue-surface)}
-.fit-result .flag.bad .dot{background:var(--red); box-shadow:0 0 0 4px var(--red-surface)}
-.fit-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:18px}
-.fit-grid .l{color:var(--dimmer); font-size:11px; margin-bottom:5px}
-
 .spinner{width:18px;height:18px;border:2.5px solid var(--edge-hi); border-top-color:var(--blue); border-radius:50%; display:none; margin:0 auto 16px; animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 .drop.busy .drop-icon{display:none}
@@ -166,7 +142,6 @@ tr:hover td{background:var(--surface-2)}
   padding:18px 20px; overflow-x:auto; font-size:12.5px; line-height:1.9; white-space:pre; color:var(--dim); font-family:var(--mono);
 }
 .hx-magic,.hx-version,.hx-tcount,.hx-kvcount{color:var(--blue); font-weight:700}
-.fit-grid .v{font-size:15px}
 
 footer{margin-top:60px; padding-top:20px; border-top:1px solid var(--edge); color:var(--dimmer); font-size:12.5px; line-height:1.7}
 footer a{color:var(--dim)}
@@ -455,7 +430,6 @@ function render(ctx){
     </div>
     <div class="tabs">
       <button class="tab active" data-tab="overview">Overview</button>
-      <button class="tab" data-tab="fitgpu">Fit GPU</button>
       <button class="tab" data-tab="metadata">Metadata</button>
       <button class="tab" data-tab="tensors">Tensors</button>
       <button class="tab" data-tab="storage">Storage</button>
@@ -466,25 +440,6 @@ function render(ctx){
       <div class="tbl-scroll"><table><thead><tr><th>Type</th><th>Tensors</th><th>Storage</th></tr></thead><tbody>
         ${Object.entries(quantCounts).map(([k,v])=>`<tr><td>${esc(k)}</td><td>${v.n}</td><td>${fmtBytes(v.bytes)}</td></tr>`).join('')}
       </tbody></table></div>
-    </div>
-    <div class="pane" data-pane="fitgpu">
-      <p class="note" style="margin-bottom:18px">Approximate GPU memory footprint from tensor sizes, real GGUF metadata, and KV cache. Estimates are ±15%.</p>
-      <div class="fit-row">
-        <div class="field"><label>Context length</label><input type="number" id="fCtx" value="4096" min="16"><div class="hint" id="fCtxHint"></div></div>
-        <div class="field"><label>GPU layers (incl. output)</label><input type="number" id="fLayers" value="0" min="0"></div>
-      </div>
-      <label style="display:block;color:var(--dimmer);font-size:11.5px;margin-bottom:7px">VRAM budget</label>
-      <div class="seg" id="fBudget">
-        <button class="seg-btn" data-v="8">8 GB</button><button class="seg-btn" data-v="12">12 GB</button>
-        <button class="seg-btn" data-v="16">16 GB</button><button class="seg-btn" data-v="24">24 GB</button>
-        <button class="seg-btn" data-v="48">48 GB</button><button class="seg-btn" data-v="80">80 GB</button>
-      </div>
-      <div class="seg" id="fFlags">
-        <button class="seg-btn" data-kv="f16">KV f16</button><button class="seg-btn" data-kv="q8_0">KV q8_0</button>
-        <button class="seg-btn" data-kv="q4_0">KV q4_0</button><button class="seg-btn" data-t="flash">Flash attn</button>
-        <button class="seg-btn" data-t="mmap">mmap</button>
-      </div>
-      <div id="fitOut"></div>
     </div>
     <div class="pane" data-pane="metadata">
       <div class="tbl-scroll"><table><thead><tr><th>Key</th><th>Type</th><th>Value</th></tr></thead><tbody>
@@ -528,178 +483,7 @@ function render(ctx){
     tensors:r.tensors.map(t=>({name:t.name,type:t.typeName,shape:t.dims,size:t.size,offset:t.offset}))},null,2);
   const cj=report.querySelector('#copyJson'); if(cj) cj.onclick=()=>{ navigator.clipboard.writeText(json); cj.textContent='Copied'; setTimeout(()=>cj.textContent='Copy JSON',1400); };
   const dj=report.querySelector('#dlJson'); if(dj) dj.onclick=()=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([json],{type:'application/json'})); a.download=(filename||'model')+'.json'; a.click(); };
-  setupFitGPU(r);
   report.scrollIntoView({block:'start'});
-}
-
-function setupFitGPU(r){
-  const kvFind = suffix => {
-    const f = r.kv.find(x => x.key === suffix || x.key.endsWith('.' + suffix));
-    if (!f) return null;
-    return typeof f.value === 'number' ? f.value : f.value;
-  };
-  const kvBoolArr = suffix => {
-    const f = r.kv.find(x => x.key === suffix || x.key.endsWith('.' + suffix));
-    return (f && f.value && f.value.items) ? f.value.items : null;
-  };
-
-  // ---- Architecture metadata ----
-  const trainCtx          = kvFind('context_length');
-  const embed             = kvFind('embedding_length');
-  const headCount         = kvFind('attention.head_count');
-  const headCountKV       = kvFind('attention.head_count_kv') || headCount;
-  const blockCount        = kvFind('block_count');
-
-  const keyLength         = kvFind('attention.key_length');
-  const valueLength       = kvFind('attention.value_length');
-  const keyLengthMLA      = kvFind('attention.key_length_mla');
-  const valueLengthMLA    = kvFind('attention.value_length_mla');
-  const headDimK          = keyLengthMLA || keyLength || (embed && headCount ? embed / headCount : 128);
-  const headDimV          = valueLengthMLA || valueLength || headDimK;
-
-  const kvLoraRank        = kvFind('attention.kv_lora_rank');
-  const qLoraRank         = kvFind('attention.q_lora_rank');
-  const isMLA             = !!(kvLoraRank || qLoraRank);
-
-  const slidingWindow     = kvFind('attention.sliding_window');
-  const hasSWA            = slidingWindow && slidingWindow > 0;
-  const swaPattern        = kvBoolArr('attention.sliding_window_pattern');
-
-  const fullAttnInterval  = kvFind('full_attention_interval');
-  const isHybrid          = fullAttnInterval && fullAttnInterval > 0;
-
-  const ssmInnerSize      = kvFind('ssm.inner_size');
-  const ssmStateSize      = kvFind('ssm.state_size');
-  const isSSM             = ssmInnerSize && ssmStateSize;
-
-  // ---- Per-layer weight accounting ----
-  const layerIdx = new Set();
-  let outputBytes = 0, layerBytesTotal = 0;
-  r.tensors.forEach(t => {
-    const m = t.name.match(/^blk\.(\d+)\./);
-    if (m) { layerIdx.add(m[1]); layerBytesTotal += t.size || 0; }
-    else { outputBytes += t.size || 0; }
-  });
-  const layerCount = blockCount || layerIdx.size || 1;
-  const totalLayersInclOutput = layerCount + 1;
-  const bytesPerLayer = layerBytesTotal / Math.max(layerIdx.size, 1);
-
-  // ---- UI ----
-  const ctxIn    = report.querySelector('#fCtx');
-  const layersIn = report.querySelector('#fLayers');
-  const ctxHint  = report.querySelector('#fCtxHint');
-  layersIn.max = totalLayersInclOutput;
-  layersIn.value = totalLayersInclOutput;
-  ctxHint.textContent = trainCtx ? `Trained at ${trainCtx.toLocaleString()} max` : '';
-
-  let budget = 8, kvType = 'f16', flash = false, mmap = true;
-  const OVERHEAD = 1024 * 1024 * 1024;
-  const KV_BYTES = { f16: 2, q8_0: 1.0, q4_0: 0.5625 };
-
-  report.querySelectorAll('#fBudget .seg-btn').forEach(b => {
-    if (+b.dataset.v === budget) b.classList.add('active');
-    b.onclick = () => { budget = +b.dataset.v;
-      report.querySelectorAll('#fBudget .seg-btn').forEach(x => x.classList.remove('active'));
-      b.classList.add('active'); compute(); };
-  });
-  report.querySelectorAll('#fFlags .seg-btn').forEach(b => {
-    if (b.dataset.kv === 'f16' || b.dataset.t === 'mmap') b.classList.add('active');
-    b.onclick = () => {
-      if (b.dataset.kv) { kvType = b.dataset.kv;
-        report.querySelectorAll('#fFlags .seg-btn[data-kv]').forEach(x => x.classList.remove('active'));
-        b.classList.add('active'); }
-      else if (b.dataset.t === 'flash') { flash = !flash; b.classList.toggle('active', flash); }
-      else if (b.dataset.t === 'mmap') { mmap = !mmap; b.classList.toggle('active', mmap); }
-      compute();
-    };
-  });
-  ctxIn.oninput = compute;
-  layersIn.oninput = compute;
-
-  function compute() {
-    const ctx = Math.max(16, parseInt(ctxIn.value) || 4096);
-    const gpuLayers = Math.max(0, Math.min(parseInt(layersIn.value) || 0, totalLayersInclOutput));
-    const gpuTransformerLayers = Math.max(0, Math.min(gpuLayers, layerIdx.size));
-
-    const gpuWeights = gpuTransformerLayers * bytesPerLayer
-                     + (gpuLayers > layerIdx.size ? outputBytes : 0);
-    const cpuWeights = (layerBytesTotal + outputBytes) - gpuWeights;
-    const bpe = KV_BYTES[kvType];
-
-    let attnLayerCount = layerCount;
-    if (isHybrid) attnLayerCount = Math.ceil(layerCount / fullAttnInterval);
-
-    let kvCacheTotal = 0;
-
-    if (isMLA) {
-      const latentRank = kvLoraRank || keyLengthMLA || 512;
-      const ropeDim = 64;
-      const mlaDim = latentRank + ropeDim;
-      kvCacheTotal = ctx * attnLayerCount * mlaDim * bpe;
-    } else if (isHybrid && isSSM) {
-      const fullLayers = attnLayerCount;
-      const linearLayers = layerCount - fullLayers;
-      const perFullLayer = headCountKV * (headDimK + headDimV) * bpe;
-      const fullKv = ctx * fullLayers * perFullLayer;
-      const linearState = linearLayers * ssmStateSize * ssmInnerSize * 4;
-      kvCacheTotal = fullKv + linearState;
-    } else if (isSSM && !headCount) {
-      kvCacheTotal = layerCount * ssmStateSize * ssmInnerSize * 4;
-    } else {
-      const nKvHeads = headCountKV || 1;
-      const dimK = headDimK || 128;
-      const dimV = headDimV || dimK;
-      const perLayerPerToken = nKvHeads * (dimK + dimV) * bpe;
-
-      if (hasSWA && swaPattern) {
-        let swaCtx = 0, globalCtx = 0;
-        for (let i = 0; i < Math.min(swaPattern.length, layerCount); i++) {
-          if (swaPattern[i]) swaCtx += Math.min(ctx, slidingWindow);
-          else globalCtx += ctx;
-        }
-        kvCacheTotal = (swaCtx + globalCtx) * perLayerPerToken;
-      } else if (hasSWA) {
-        const swaLayers = Math.round(attnLayerCount * 0.75);
-        const globalLayers = attnLayerCount - swaLayers;
-        const effCtxSWA = Math.min(ctx, slidingWindow);
-        kvCacheTotal = (effCtxSWA * swaLayers + ctx * globalLayers) * perLayerPerToken;
-      } else {
-        kvCacheTotal = ctx * attnLayerCount * perLayerPerToken;
-      }
-    }
-
-    const kvCacheGpuShare = gpuLayers > 0
-      ? kvCacheTotal * (gpuTransformerLayers / Math.max(layerCount, 1)) : 0;
-    const overhead = gpuLayers > 0 ? OVERHEAD : 0;
-
-    const GiB = 1024 * 1024 * 1024;
-    const vramBytes = gpuWeights + kvCacheGpuShare + overhead;
-    const ramBytes = (mmap ? 0 : cpuWeights)
-                   + (kvCacheTotal - kvCacheGpuShare)
-                   + (gpuLayers > 0 ? 0 : 512 * 1024 * 1024);
-    const budgetBytes = budget * GiB;
-    const fits = vramBytes <= budgetBytes;
-    const cpuOnly = gpuLayers === 0;
-
-    const out = report.querySelector('#fitOut');
-    out.innerHTML = `
-      <div class="fit-result">
-        <div class="flag ${cpuOnly ? '' : (fits ? 'ok' : 'bad')}">
-          <span class="dot" style="${cpuOnly ? 'background:var(--dim)' : ''}"></span>
-          ${cpuOnly
-            ? 'CPU only: 0 B VRAM · ' + fmtBytes(ramBytes) + ' RAM'
-            : (fits ? 'Fits' : 'Over budget') + ': ' + fmtBytes(vramBytes) + ' VRAM · ' + fmtBytes(ramBytes) + ' RAM'}
-        </div>
-        <div class="fit-grid">
-          <div><div class="l">GPU weights</div><div class="v">${fmtBytes(gpuWeights)}</div></div>
-          <div><div class="l">CPU weights</div><div class="v">${fmtBytes(cpuWeights)}</div></div>
-          <div><div class="l">KV cache</div><div class="v">${fmtBytes(kvCacheTotal)}</div></div>
-          <div><div class="l">Overhead</div><div class="v">${fmtBytes(overhead)}</div></div>
-        </div>
-      </div>
-      <p class="note">Overhead is a fixed 1024 MiB (llama.cpp fit target margin).</p>`;
-  }
-  compute();
 }
 </script>
 </body>
